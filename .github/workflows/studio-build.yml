@@ -97,14 +97,14 @@ jobs:
           context: repo
           load: true
           platforms: linux/amd64
-          tags: ghcr.io/ishansiy/march7th-studio-build:latest
+          tags: ghcr.io/ishansiy/m7a-studio:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Verify startup, authentication, persistence and version
         run: |
           set -euo pipefail
-          image=ghcr.io/ishansiy/march7th-studio-build:latest
+          image=ghcr.io/ishansiy/m7a-studio:latest
           docker volume create m7a-test
           docker run -d --name m7a-test -p 7860:7860 \
             -e WEBUI_TOKEN=ci-test-only -v m7a-test:/mnt/workspace "$image"
@@ -127,14 +127,26 @@ jobs:
         id: publish
         run: |
           set -euo pipefail
-          docker tag ghcr.io/ishansiy/march7th-studio-build:latest \
-            ghcr.io/ishansiy/march7th-studio-build:${{ github.run_id }}
-          docker push ghcr.io/ishansiy/march7th-studio-build:${{ github.run_id }}
-          docker push ghcr.io/ishansiy/march7th-studio-build:latest | tee /tmp/push.txt
+          docker tag ghcr.io/ishansiy/m7a-studio:latest \
+            ghcr.io/ishansiy/m7a-studio:${{ github.run_id }}
+          docker push ghcr.io/ishansiy/m7a-studio:${{ github.run_id }}
+          docker push ghcr.io/ishansiy/m7a-studio:latest | tee /tmp/push.txt
           digest=$(sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' /tmp/push.txt | tail -1)
           test -n "$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Published digest: $digest"
+
+      - name: Verify the image is anonymously pullable
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://ghcr.io/token?scope=repository%3Aishansiy%2Fm7a-studio%3Apull&service=ghcr.io")
+          echo "anonymous pull probe: $code"
+          if [ "$code" != "200" ]; then
+            echo '::error::Image is not publicly pullable; the Studio builder fetches it anonymously. Make the package public before deploying.'
+            exit 1
+          fi
+          echo 'Image is publicly pullable.'
 
   deploy:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy
@@ -182,7 +194,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           previous=$(git rev-parse HEAD)
-          printf 'FROM ghcr.io/ishansiy/march7th-studio-build@%s\nEXPOSE 7860\n' "$IMAGE_DIGEST" > Dockerfile
+          printf 'FROM ghcr.io/ishansiy/m7a-studio@%s\nEXPOSE 7860\n' "$IMAGE_DIGEST" > Dockerfile
           if git diff --quiet; then
             echo 'Studio already references this image; no restart needed.'
             exit 0
