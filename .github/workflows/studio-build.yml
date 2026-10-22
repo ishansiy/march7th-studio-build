@@ -1,0 +1,218 @@
+name: Studio build and deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to the Studio when idle
+        type: boolean
+        default: true
+  schedule:
+    - cron: '23 18 * * *'
+
+concurrency:
+  group: march7th-studio
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - name: Clone fork and merge upstream main
+        id: merge
+        run: |
+          set -euo pipefail
+          git clone https://github.com/ishansiy/March7thAssistant.git repo
+          cd repo
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/moesnow/March7thAssistant.git
+          git fetch --depth=200 upstream main
+          before=$(git rev-parse HEAD)
+          if git merge --no-edit upstream/main; then
+            echo "merge ok"
+          else
+            echo '::error::Upstream merge produced conflicts; resolve manually.'
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          after=$(git rev-parse HEAD)
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream updates merged."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Merged $(git rev-list --count "$before".."$after") upstream commits."
+          fi
+
+      - name: Report resolved version
+        id: version
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          v=$(cat assets/config/version.txt)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $v"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: repo/webui/pnpm-lock.yaml
+
+      - name: Build frontend
+        working-directory: repo/webui
+        run: |
+          set -euo pipefail
+          if rg 'Authorization' src/js; then
+            echo '::error::Reserved ModelScope header found in frontend'
+            exit 1
+          fi
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: repo
+          load: true
+          platforms: linux/amd64
+          tags: ghcr.io/ishansiy/march7th-studio-build:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify startup, authentication, persistence and version
+        run: |
+          set -euo pipefail
+          image=ghcr.io/ishansiy/march7th-studio-build:latest
+          docker volume create m7a-test
+          docker run -d --name m7a-test -p 7860:7860 \
+            -e WEBUI_TOKEN=ci-test-only -v m7a-test:/mnt/workspace "$image"
+          ready=false
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:7860/healthz; then ready=true; break; fi
+            sleep 3
+          done
+          if [ "$ready" != true ]; then docker logs m7a-test; exit 1; fi
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7860/api/accounts)" = 401
+          curl -fsS -H 'X-M7A-Token: Bearer ci-test-only' http://localhost:7860/api/accounts
+          curl -fsS -H 'X-M7A-Token: Bearer ci-test-only' http://localhost:7860/api/auth/me \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["role"] == "admin"'
+          docker exec m7a-test python -c 'from pathlib import Path; assert Path("/m7a/webui/data").resolve() == Path("/mnt/workspace/webui/data"); assert Path("/m7a/logs").resolve() == Path("/mnt/workspace/logs")'
+          echo -n 'Bundled version: '
+          docker exec m7a-test cat /m7a/assets/config/version.txt
+          docker rm -f m7a-test
+
+      - name: Publish validated image
+        id: publish
+        run: |
+          set -euo pipefail
+          docker tag ghcr.io/ishansiy/march7th-studio-build:latest \
+            ghcr.io/ishansiy/march7th-studio-build:${{ github.run_id }}
+          docker push ghcr.io/ishansiy/march7th-studio-build:${{ github.run_id }}
+          docker push ghcr.io/ishansiy/march7th-studio-build:latest | tee /tmp/push.txt
+          digest=$(sed -n 's/.*digest: \(sha256:[a-f0-9]\{64\}\).*/\1/p' /tmp/push.txt | tail -1)
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published digest: $digest"
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Deploy validated digest when Studio is idle
+        env:
+          MODELSCOPE_API_KEY: ${{ secrets.MODELSCOPE_API_KEY }}
+          WEBUI_TOKEN: ${{ secrets.STUDIO_WEBUI_TOKEN }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          STUDIO='https://modelscope.cn/openapi/v1/studios/hansiy/March7thAssistant'
+          APP='https://hansiy-march7thassistant.ms.show'
+          UA='Mozilla/5.0 (compatible; March7thStudioUpdater/1.0)'
+          if [ -z "${MODELSCOPE_API_KEY:-}" ] || [ -z "${WEBUI_TOKEN:-}" ]; then
+            echo '::error::Deployment secrets are missing'
+            exit 1
+          fi
+          info=$(curl -fsS -H "Authorization: Bearer $MODELSCOPE_API_KEY" "$STUDIO")
+          echo "$info" | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)["data"]
+          if d.get("hardware") != "platform/2v-cpu-16g-mem":
+              raise SystemExit("Hardware changed; refusing deployment")
+          if d.get("status") != "Running":
+              raise SystemExit("Studio is not Running; defer deployment")
+          print("Studio status OK:", d.get("status"), d.get("hardware"), file=sys.stderr)
+          '
+          state=$(curl -fsS -A "$UA" -H "X-M7A-Token: Bearer $WEBUI_TOKEN" "$APP/api/status")
+          running=$(echo "$state" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("running")).lower())')
+          waiting=$(echo "$state" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("waiting_for_retry")).lower())')
+          if [ "$running" = true ] || [ "$waiting" = true ]; then
+            echo '::error::A task is active; refusing to interrupt it'
+            exit 1
+          fi
+          echo 'Studio is idle; proceeding.'
+
+          auth="Authorization: Basic $(printf 'oauth2:%s' "$MODELSCOPE_API_KEY" | base64 -w0)"
+          git -c http.extraHeader="$auth" clone --depth=1 \
+            https://modelscope.cn/studios/hansiy/March7thAssistant.git studio
+          cd studio
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          previous=$(git rev-parse HEAD)
+          printf 'FROM ghcr.io/ishansiy/march7th-studio-build@%s\nEXPOSE 7860\n' "$IMAGE_DIGEST" > Dockerfile
+          if git diff --quiet; then
+            echo 'Studio already references this image; no restart needed.'
+            exit 0
+          fi
+          git add Dockerfile
+          git commit -m "Deploy validated image $IMAGE_DIGEST"
+          git -c http.extraHeader="$auth" push origin HEAD:master
+          echo "Previous Studio commit for rollback: $previous"
+
+          res=$(curl -fsS -X POST -H "Authorization: Bearer $MODELSCOPE_API_KEY" "$STUDIO/deploy")
+          echo "$res" | head -c 300; echo
+
+          deadline=$(( $(date +%s) + 2700 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 15
+            st=$(curl -fsS -H "Authorization: Bearer $MODELSCOPE_API_KEY" "$STUDIO" |
+                 python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["status"])')
+            if [ "$st" = Running ]; then
+              if curl -fsS -A "$UA" "$APP/healthz" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"]=="ok"'; then
+                curl -fsS -A "$UA" -H "X-M7A-Token: Bearer $WEBUI_TOKEN" "$APP/api/status"
+                echo
+                echo 'Deployment is Running; health and authenticated API checks passed.'
+                exit 0
+              fi
+            fi
+            if [ "$st" = Failed ] || [ "$st" = BuildFailed ] || [ "$st" = RuntimeError ] || [ "$st" = Stopped ]; then
+              echo "::error::Studio deployment failed: $st"
+              exit 1
+            fi
+            echo "Waiting for Studio: $st"
+          done
+          echo '::error::Studio did not become healthy within 45 minutes'
+          exit 1
