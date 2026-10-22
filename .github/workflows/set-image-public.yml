@@ -1,0 +1,33 @@
+name: Set image public
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  visibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Try to make the container package publicly pullable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          for owner_path in user users/ishansiy; do
+            for method in PATCH POST; do
+              echo "--- $method /$owner_path/packages/container/march7th-studio-build/visibility ---"
+              gh api -X "$method" \
+                "/$owner_path/packages/container/march7th-studio-build/visibility" \
+                -f visibility=public 2>&1 | head -c 400
+              echo
+            done
+          done
+          echo "--- read current package metadata ---"
+          gh api "/users/ishansiy/packages/container/march7th-studio-build" 2>&1 | head -c 500
+          echo
+          echo "--- anonymous token probe ---"
+          curl -s -o /dev/null -w "anonymous token http=%{http_code}\n" \
+            "https://ghcr.io/token?scope=repository%3Aishansiy%2Fmarch7th-studio-build%3Apull&service=ghcr.io"
